@@ -2,58 +2,53 @@ use std::collections::BTreeMap;
 use std::io::prelude::*;
 
 fn main() {
-    let platform = if let Some(platform) = option_env!("Platform") {
-        match platform {
-            "x86" => "i686_msvc",
-            "x64" => "x86_64_msvc",
-            "arm64" => "aarch64_msvc",
-            _ => {
-                println!("Unknown platform");
-                return;
-            }
+    for cmd in ["llvm-dlltool", "llvm-ar"] {
+        if which::which(cmd).is_err() {
+            eprintln!("Could not find {}. Is it in your $PATH?", cmd);
+            return;
         }
-    } else {
-        println!("Please run this tool from a Visual Studio command prompt");
+    }
+    let target = std::env::args().collect::<Vec<_>>();
+    let mut platform_and_target = vec![];
+    if target.iter().any(|x| x == "x86_64") || target.iter().any(|x| x == "all") {
+        platform_and_target.push(("x86_64_msvc", "i386:x86-64"));
+    }
+    if target.iter().any(|x| x == "aarch64") || target.iter().any(|x| x == "all") {
+        platform_and_target.push(("aarch64_msvc", "arm64"));
+    }
+    if target.iter().any(|x| x == "i686") || target.iter().any(|x| x == "all") {
+        platform_and_target.push(("i686_msvc", "i386"));
+    }
+    if platform_and_target.is_empty() {
+        eprintln!("Please specify at least one architecture or use 'all' argument");
         return;
     };
 
     let libraries = lib::libraries();
-    let output = std::path::PathBuf::from(format!("crates/targets/{}/lib", platform));
-    let _ = std::fs::remove_dir_all(&output);
-    std::fs::create_dir_all(&output).unwrap();
 
-    for (library, functions) in &libraries {
-        build_library(&output, library, functions);
-    }
+    for (platform, dlltool_target) in platform_and_target {
+        let output = std::path::PathBuf::from(format!("crates/targets/{}/lib", platform));
+        let _ = std::fs::remove_dir_all(&output);
+        std::fs::create_dir_all(&output).unwrap();
 
-    let mut cmd = std::process::Command::new("lib");
-    cmd.current_dir(&output);
-    cmd.arg("/nologo");
-    cmd.arg("/out:windows.lib");
+        for (library, functions) in &libraries {
+            build_library(&output, library, functions, dlltool_target);
+        }
 
-    for library in libraries.keys() {
-        cmd.arg(format!("{}.lib", library));
-    }
+        build_mri(&output, &libraries);
 
-    cmd.output().unwrap();
-
-    for library in libraries.keys() {
-        std::fs::remove_file(output.join(format!("{}.lib", library))).unwrap();
+        for library in libraries.keys() {
+            std::fs::remove_file(output.join(format!("{}.lib", library))).unwrap();
+        }
     }
 }
 
-fn build_library(output: &std::path::Path, library: &str, functions: &BTreeMap<String, usize>) {
+fn build_library(output: &std::path::Path, library: &str, functions: &BTreeMap<String, usize>, dlltool_target: &str) {
     println!("{}", library);
 
     // Note that we don't use set_extension as it confuses PathBuf when the library name includes a period.
-
-    let mut path = std::path::PathBuf::from(output);
-    path.push(format!("{}.c", library));
-    let mut c = std::fs::File::create(&path).unwrap();
-
-    path.pop();
-    path.push(format!("{}.def", library));
-    let mut def = std::fs::File::create(&path).unwrap();
+    let def_path = output.join(format!("{}.def", library));
+    let mut def = std::fs::File::create(&def_path).unwrap();
 
     def.write_all(
         format!(
@@ -67,55 +62,51 @@ EXPORTS
     )
     .unwrap();
 
-    for (function, params) in functions {
-        let mut buffer = format!("void __stdcall {}(", function);
-
-        for param in 0..*params {
-            use std::fmt::Write;
-            write!(&mut buffer, "int p{}, ", param).unwrap();
+    if dlltool_target == "i386" {
+        for (function, params) in functions {
+            def.write_all(format!("{}@{}\n", function, params).as_bytes()).unwrap();
         }
-
-        if buffer.ends_with(' ') {
-            buffer.truncate(buffer.len() - 2);
+    } else {
+        for function in functions.keys() {
+            def.write_all(format!("{}\n", function).as_bytes()).unwrap();
         }
-
-        buffer.push_str(") {}\n");
-
-        c.write_all(buffer.as_bytes()).unwrap();
-        def.write_all(format!("{}\n", function).as_bytes()).unwrap();
     }
 
-    drop(c);
     drop(def);
 
-    let mut cmd = std::process::Command::new("cl");
-    cmd.current_dir(output);
-    cmd.arg("/nologo");
-    cmd.arg("/c");
-    cmd.arg(format!("{}.c", library));
+    let mut cmd = std::process::Command::new("llvm-dlltool");
+    cmd.current_dir(&output);
+
+    cmd.arg("-k");
+    cmd.arg("-m");
+    cmd.arg(dlltool_target);
+    cmd.arg("-d");
+    cmd.arg(format!("{}.def", library));
+    cmd.arg("-l");
+    cmd.arg(format!("{}.lib", library));
     cmd.output().unwrap();
 
-    let mut cmd = std::process::Command::new("lib");
-    cmd.current_dir(output);
-    cmd.arg("/nologo");
-    cmd.arg(format!("/out:{}.lib", library));
-    cmd.arg(format!("/def:{}.def", library));
-    cmd.arg(format!("{}.obj", library));
+    std::fs::remove_file(output.join(format!("{}.def", library))).unwrap();
+}
+
+fn build_mri(output: &std::path::Path, libraries: &BTreeMap<String, BTreeMap<String, usize>>) {
+    let mri_path = output.join("unified.mri");
+    let mut mri = std::fs::File::create(&mri_path).unwrap();
+    println!("Generating {}", mri_path.to_string_lossy());
+
+    mri.write_all(b"CREATE windows.lib\n").unwrap();
+
+    for library in libraries.keys() {
+        mri.write_all(format!("ADDLIB {}.lib\n", library).as_bytes()).unwrap();
+    }
+
+    mri.write_all(b"SAVE\nEND\n").unwrap();
+
+    let mut cmd = std::process::Command::new("llvm-ar");
+    cmd.current_dir(&output);
+    cmd.arg("-M");
+    cmd.stdin(std::fs::File::open(&mri_path).unwrap());
     cmd.output().unwrap();
 
-    path.pop();
-    path.push(format!("{}.c", library));
-    std::fs::remove_file(&path).unwrap();
-
-    path.pop();
-    path.push(format!("{}.def", library));
-    std::fs::remove_file(&path).unwrap();
-
-    path.pop();
-    path.push(format!("{}.exp", library));
-    std::fs::remove_file(&path).unwrap_or_else(|_| panic!("{:?}", path));
-
-    path.pop();
-    path.push(format!("{}.obj", library));
-    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_file(&mri_path).unwrap();
 }

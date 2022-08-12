@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 lib = { package = "tool_lib", path = "../lib" }
+which = "4"
