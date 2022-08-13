@@ -56,7 +56,7 @@ fn build_library(output: &std::path::Path, library: &str, functions: &BTreeMap<S
 LIBRARY {}
 EXPORTS
 "#,
-            library
+            if [".drv", ".cpl"].iter().any(|e| library.ends_with(e)) { library.to_owned() } else { format!("{}.dll", library) }
         )
         .as_bytes(),
     )
