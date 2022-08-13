@@ -11,8 +11,6 @@ fn test_yml() {
 on:
   pull_request:
   push:
-    branches:
-      - master
 
 env:
   RUSTFLAGS: -Dwarnings
@@ -23,6 +21,7 @@ jobs:
     runs-on: windows-2019
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - version: stable
@@ -143,8 +142,6 @@ fn build_yml() {
 on:
   pull_request:
   push:
-    branches:
-      - master
 
 env:
   RUSTFLAGS: -Dwarnings
